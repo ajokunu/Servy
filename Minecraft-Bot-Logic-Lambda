@@ -1,0 +1,730 @@
+const nacl = require('tweetnacl');
+const { REST } = require('@discordjs/rest');
+const { Routes } = require('discord-api-types/v10');
+const AWS = require('aws-sdk');
+const net = require('net');
+const os = require('os');
+
+// Set up AWS EC2 client
+const ec2 = new AWS.EC2({ region: process.env.MINECRAFT_REGION || 'us-east-1' });
+const dynamodb = new AWS.DynamoDB.DocumentClient();
+const INSTANCE_ID = process.env.INSTANCE_ID;
+
+// Set up Discord REST API client
+const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+
+// Enhanced logging function
+function log(level, message, extra = {}) {
+  const logEntry = {
+    level,
+    message,
+    timestamp: new Date().toISOString(),
+    ...extra
+  };
+  console.log(JSON.stringify(logEntry));
+}
+
+/**
+ * Manual verification function using tweetnacl
+ */
+function verifyKey(body, signature, timestamp, publicKey) {
+  try {
+    // Convert the public key to a Uint8Array
+    const publicKeyBuffer = Buffer.from(publicKey, 'hex');
+    
+    // Create the message that Discord signs
+    const message = Buffer.from(timestamp + body);
+    
+    // Convert the signature to a Uint8Array
+    const signatureBuffer = Buffer.from(signature, 'hex');
+    
+    // Verify the signature using tweetnacl
+    const verified = nacl.sign.detached.verify(
+      message,
+      signatureBuffer,
+      publicKeyBuffer
+    );
+    
+    log('INFO', 'Signature verification', { 
+      verified,
+      publicKeyLength: publicKeyBuffer.length,
+      signatureLength: signatureBuffer.length,
+      messageLength: message.length
+    });
+    
+    return verified;
+  } catch (error) {
+    log('ERROR', 'Verification error', { error: error.message });
+    return false;
+  }
+}
+
+/**
+ * Start the Minecraft server
+ */
+async function startServer() {
+  try {
+    // First check the current status
+    const status = await getInstanceStatus();
+    
+    if (status === 'running') {
+      return '✅ The Minecraft server is already running!';
+    }
+    
+    if (status === 'pending') {
+      return '⏳ The Minecraft server is starting... Please wait.';
+    }
+
+    // If the instance is stopped, start it
+    await ec2.startInstances({
+      InstanceIds: [INSTANCE_ID]
+    }).promise();
+    
+    // Reset the idle timer in DynamoDB
+    await resetIdleTimer();
+    
+    // Get the public IP
+    const instanceData = await ec2.describeInstances({
+      InstanceIds: [INSTANCE_ID]
+    }).promise();
+    
+    const publicIp = instanceData.Reservations[0].Instances[0].PublicIpAddress;
+    
+    return `🚀 Server is starting! It will be ready in about 2-3 minutes.\nConnect using: **${publicIp}:25565**\n\n_The server will automatically shut down after 5 minutes of inactivity._`;
+  } catch (error) {
+    log('ERROR', 'Error starting server', { error: error.message });
+    return '❌ There was an error starting the server. Please try again later.';
+  }
+}
+
+/**
+ * Stop the Minecraft server
+ */
+async function stopServer() {
+  try {
+    const status = await getInstanceStatus();
+    
+    if (status === 'stopped') {
+      return '✅ The Minecraft server is already stopped.';
+    }
+    
+    if (status === 'stopping') {
+      return '⏳ The Minecraft server is already stopping...';
+    }
+    
+    // Send a command to safely stop the Minecraft server first (if possible)
+    try {
+      await safelyStopMinecraftServer();
+      // Wait a bit for the server to shut down gracefully
+      await new Promise(resolve => setTimeout(resolve, 10000));
+    } catch (error) {
+      log('WARN', 'Failed to safely stop Minecraft server', { error: error.message });
+      // Continue anyway to stop the EC2 instance
+    }
+    
+    // Now stop the EC2 instance
+    await ec2.stopInstances({
+      InstanceIds: [INSTANCE_ID]
+    }).promise();
+    
+    return '🛑 Stopping the Minecraft server... This will take a moment.';
+  } catch (error) {
+    log('ERROR', 'Error stopping server', { error: error.message });
+    return '❌ There was an error stopping the server. Please try again later.';
+  }
+}
+
+/**
+ * Safely stop the Minecraft server before stopping EC2
+ */
+async function safelyStopMinecraftServer() {
+  // You could implement RCON, SSH, or another method to safely stop the Minecraft server
+  // This is a placeholder for that functionality
+  log('INFO', 'Attempting to safely stop Minecraft server');
+  return true;
+}
+
+/**
+ * Check the status of the Minecraft server
+ */
+async function checkStatus() {
+  try {
+    const status = await getInstanceStatus();
+    
+    if (status === 'running') {
+      // Get the public IP
+      const instanceData = await ec2.describeInstances({
+        InstanceIds: [INSTANCE_ID]
+      }).promise();
+      
+      const publicIp = instanceData.Reservations[0].Instances[0].PublicIpAddress;
+      
+      // Check if Minecraft server is actually running
+      const isMinecraftRunning = await checkMinecraftServerRunning(publicIp);
+      const playerCount = isMinecraftRunning ? await getPlayerCount(publicIp) : 0;
+      
+      let statusMessage = `✅ The server is running!\nConnect using: **${publicIp}:25565**`;
+      
+      if (isMinecraftRunning) {
+        statusMessage += `\nPlayers online: **${playerCount}**`;
+        statusMessage += '\n\n_The server will automatically shut down after 5 minutes of inactivity._';
+      } else {
+        statusMessage += '\n⚠️ The Minecraft server process is not responding yet. It might still be starting up.';
+      }
+      
+      return statusMessage;
+    } else if (status === 'stopped') {
+      return '🛑 The Minecraft server is currently stopped. Use the Start button to start it.';
+    } else {
+      return `⏳ The Minecraft server is in the "${status}" state.`;
+    }
+  } catch (error) {
+    log('ERROR', 'Error checking status', { error: error.message });
+    return '❌ There was an error checking the server status.';
+  }
+}
+
+/**
+ * Get list of currently online players
+ */
+async function getPlayers() {
+  try {
+    const status = await getInstanceStatus();
+    
+    if (status !== 'running') {
+      return '⚠️ The Minecraft server is not running. Start the server first to see player list.';
+    }
+    
+    // Get the public IP
+    const instanceData = await ec2.describeInstances({
+      InstanceIds: [INSTANCE_ID]
+    }).promise();
+    
+    const publicIp = instanceData.Reservations[0].Instances[0].PublicIpAddress;
+    
+    // Check if Minecraft server is actually running
+    const isMinecraftRunning = await checkMinecraftServerRunning(publicIp);
+    
+    if (!isMinecraftRunning) {
+      return '⚠️ The Minecraft server process is not responding yet. It might still be starting up.';
+    }
+    
+    // Get player list - in a real implementation, you'd query the Minecraft server
+    // This is a placeholder - replace with actual player querying code in next feature release, probably might scrap as irrelevate
+    const players = []; // This would be populated with real player data
+    
+    if (players.length === 0) {
+      return '👀 No players are currently online.';
+    }
+    
+    return `👥 **Online Players (${players.length}):**\n${players.join('\n')}`;
+  } catch (error) {
+    log('ERROR', 'Error getting player list', { error: error.message });
+    return '❌ There was an error getting the player list. Please try again later.';
+  }
+}
+
+/**
+ * Get server uptime, may scrap this as irrelevant since the server uptime should always be minimal if players are logging out? 
+ */
+async function getUptime() {
+  try {
+    const status = await getInstanceStatus();
+    
+    if (status !== 'running') {
+      return '⚠️ The Minecraft server is not running.';
+    }
+    
+    // Get the instance launch time
+    const instanceData = await ec2.describeInstances({
+      InstanceIds: [INSTANCE_ID]
+    }).promise();
+    
+    const launchTime = new Date(instanceData.Reservations[0].Instances[0].LaunchTime);
+    const now = new Date();
+    const uptimeMs = now - launchTime;
+    
+    // Format uptime
+    const days = Math.floor(uptimeMs / (1000 * 60 * 60 * 24));
+    const hours = Math.floor((uptimeMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+    const minutes = Math.floor((uptimeMs % (1000 * 60 * 60)) / (1000 * 60));
+    
+    return `⏱️ Server uptime: ${days}d ${hours}h ${minutes}m`;
+  } catch (error) {
+    log('ERROR', 'Error getting uptime', { error: error.message });
+    return '❌ There was an error getting the server uptime. Please try again later.';
+  }
+}
+
+/**
+ * Get help information
+ */
+function getHelp() {
+  return `
+**Minecraft Server Bot Commands**
+
+**/server** - Show server control buttons for starting, stopping, and checking status
+**/players** - List players currently connected to the server
+**/uptime** - Show how long the server has been running
+**/help** - Show this help message
+
+**Button Controls**
+🟢 **Start Server** - Start the Minecraft server if it's stopped
+🔵 **Check Status** - Check if the server is running and get connection info
+🔴 **Stop Server** - Safely stop the Minecraft server (admin only)
+
+The server will automatically shut down after 5 minutes of inactivity to save costs.
+`;
+}
+
+/**
+ * Check if Minecraft server is running on the given IP
+ */
+async function checkMinecraftServerRunning(ip, port = 25565) {
+  return new Promise((resolve) => {
+    const client = new net.Socket();
+    const timeout = setTimeout(() => {
+      client.destroy();
+      resolve(false);
+    }, 3000);
+    
+    client.connect(port, ip, () => {
+      clearTimeout(timeout);
+      client.destroy();
+      resolve(true);
+    });
+    
+    client.on('error', () => {
+      clearTimeout(timeout);
+      resolve(false);
+    });
+  });
+}
+
+/**
+ * Get player count from Minecraft server
+ */
+async function getPlayerCount(ip, port = 25565) {
+  // Placeholder - in a real implementation, you'd query the Minecraft server
+  // For a proper implementation, consider using a library like 'minecraft-server-util'
+  return 0;
+}
+
+/**
+ * Get the current instance status with fallback methods
+ */
+async function getInstanceStatus() {
+  try {
+    const data = await ec2.describeInstanceStatus({
+      InstanceIds: [INSTANCE_ID],
+      IncludeAllInstances: true
+    }).promise();
+    
+    if (data.InstanceStatuses && data.InstanceStatuses.length > 0) {
+      return data.InstanceStatuses[0].InstanceState.Name;
+    } 
+    
+    // Fallback if no status found in primary method
+    const instanceData = await ec2.describeInstances({
+      InstanceIds: [INSTANCE_ID]
+    }).promise();
+    
+    if (instanceData.Reservations && 
+        instanceData.Reservations.length > 0 && 
+        instanceData.Reservations[0].Instances && 
+        instanceData.Reservations[0].Instances.length > 0) {
+      return instanceData.Reservations[0].Instances[0].State.Name;
+    }
+    
+    throw new Error('Unable to determine instance status');
+  } catch (error) {
+    log('ERROR', 'Error getting instance status', { error: error.message });
+    throw error;
+  }
+}
+
+/**
+ * Reset the idle timer in DynamoDB
+ */
+async function resetIdleTimer() {
+  const params = {
+    TableName: process.env.DYNAMO_TABLE || 'MinecraftServerStatus',
+    Item: {
+      ServerId: INSTANCE_ID,
+      LastActivity: Math.floor(Date.now() / 1000), // Current time in seconds
+      PlayerCount: 0
+    }
+  };
+  
+  try {
+    await dynamodb.put(params).promise();
+    log('INFO', 'Reset idle timer', { instanceId: INSTANCE_ID });
+    return true;
+  } catch (error) {
+    log('ERROR', 'Failed to reset idle timer', { error: error.message });
+    return false;
+  }
+}
+
+// Helper function to extract interaction token
+function getInteractionToken(interaction) {
+  // Log structure to help debug
+  log('DEBUG', 'Interaction token diagnostics', {
+    hasToken: typeof interaction.token === 'string',
+    tokenLength: interaction.token ? interaction.token.length : 0,
+    interactionId: interaction.id
+  });
+  
+  // Return the token
+  return interaction.token;
+}
+
+/**
+ * Send a message to Discord via webhook - SIMPLIFIED APPROACH
+ */
+async function sendDiscordWebhookMessage(applicationId, token, content) {
+  // Log diagnostics but don't include the full token for security
+  log('INFO', 'Attempting to send webhook message', {
+    applicationId,
+    tokenFirstChars: token ? token.substring(0, 5) + '...' : 'none',
+    contentLength: content ? content.length : 0
+  });
+  
+  try {
+    // Use the official Discord API follow-up message endpoint with relative URL
+    // This works better with the REST client
+    await rest.post(
+      Routes.webhookCallback(applicationId, token),
+      {
+        body: {
+          content: content
+        }
+      }
+    );
+    log('INFO', 'Webhook message sent successfully');
+    return true;
+  } catch (error) {
+    log('ERROR', 'Failed to send webhook message', { 
+      error: error.message, 
+      statusCode: error.status || 'unknown'
+    });
+    throw error;
+  }
+}
+
+/**
+ * Lambda handler for Discord interactions
+ */
+exports.handler = async (event, context) => {
+  // Tell Lambda to wait for all handlers to complete
+  context.callbackWaitsForEmptyEventLoop = true;
+  
+  log('INFO', 'Received event', { 
+    method: event.requestContext?.http?.method || 'Unknown',
+    path: event.requestContext?.http?.path || 'Unknown'
+  });
+  
+  try {
+    // Extract headers FIRST (case-insensitive) before parsing body
+    const headers = event.headers || {};
+    let signature = null;
+    let timestamp = null;
+    
+    for (const key in headers) {
+      if (key.toLowerCase() === 'x-signature-ed25519') {
+        signature = headers[key];
+      }
+      if (key.toLowerCase() === 'x-signature-timestamp') {
+        timestamp = headers[key];
+      }
+    }
+    
+    log('INFO', 'Extracted headers', { 
+      hasSignature: !!signature, 
+      hasTimestamp: !!timestamp
+    });
+    
+    // Verify the signature BEFORE parsing the body
+    if (signature && timestamp && process.env.DISCORD_PUBLIC_KEY && event.body) {
+      const isValid = verifyKey(
+        event.body, 
+        signature, 
+        timestamp, 
+        process.env.DISCORD_PUBLIC_KEY
+      );
+      
+      if (!isValid) {
+        log('WARN', 'Invalid request signature');
+        return {
+          statusCode: 401,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ error: 'Invalid request signature' })
+        };
+      }
+    } else {
+      log('WARN', 'Missing verification components');
+      return {
+        statusCode: 401,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ error: 'Missing required verification components' })
+      };
+    }
+    
+    // Now parse the body (after verification)
+    let body;
+    try {
+      body = JSON.parse(event.body);
+      log('INFO', 'Parsed body', { type: body.type });
+    } catch (error) {
+      log('ERROR', 'Failed to parse body', { error: error.message });
+      return {
+        statusCode: 400,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ error: 'Invalid request body' })
+      };
+    }
+    
+    // Extract the interaction token for later use
+    // This is critical for the followup messages to work
+    const interactionToken = getInteractionToken(body);
+    
+    // Handle the interaction to get the immediate response
+    if (body.type === 1) {
+      // PING - respond immediately
+      log('INFO', 'Responding to PING with PONG');
+      return {
+        statusCode: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 1 })
+      };
+    } 
+    else if (body.type === 2) {
+      // Slash command - process based on command name
+      const commandName = body.data.name;
+      log('INFO', 'Handling slash command', { name: commandName });
+      
+      if (commandName === 'server') {
+        // Return the server controls message directly
+        log('INFO', 'Returning server controls');
+        return {
+          statusCode: 200,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 4, // CHANNEL_MESSAGE_WITH_SOURCE
+            data: {
+              content: "What would you like to do with the Minecraft server?",
+              components: [
+                {
+                  type: 1, // ACTION_ROW
+                  components: [
+                    {
+                      type: 2, // BUTTON
+                      custom_id: "start_server",
+                      style: 3, // SUCCESS (green)
+                      label: "Start Server"
+                    },
+                    {
+                      type: 2, // BUTTON
+                      custom_id: "status_server",
+                      style: 1, // PRIMARY (blue)
+                      label: "Check Status"
+                    },
+                    {
+                      type: 2, // BUTTON
+                      custom_id: "stop_server",
+                      style: 4, // DANGER (red)
+                      label: "Stop Server"
+                    }
+                  ]
+                }
+              ]
+            }
+          })
+        };
+      } 
+      else if (commandName === 'players') {
+        // Show thinking state
+        const response = { type: 5 }; // DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
+        
+        // Process players command asynchronously
+        const processPromise = (async () => {
+          try {
+            await new Promise(resolve => setTimeout(resolve, 500));
+            const playerList = await getPlayers();
+            
+            // Use the simplified webhook sender function
+            await sendDiscordWebhookMessage(
+              process.env.APPLICATION_ID,
+              interactionToken,
+              playerList
+            );
+          } catch (error) {
+            log('ERROR', 'Error in players command', { error: error.message, stack: error.stack });
+          }
+        })();
+        
+        // Return immediate response but ensure Lambda waits for processing
+        return Promise.all([
+          {
+            statusCode: 200,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(response)
+          },
+          processPromise
+        ]).then(([response]) => response);
+      }
+      else if (commandName === 'uptime') {
+        // Show thinking state
+        const response = { type: 5 }; // DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
+        
+        // Process uptime command asynchronously
+        const processPromise = (async () => {
+          try {
+            await new Promise(resolve => setTimeout(resolve, 500));
+            const uptimeInfo = await getUptime();
+            
+            // Use the simplified webhook sender function
+            await sendDiscordWebhookMessage(
+              process.env.APPLICATION_ID,
+              interactionToken,
+              uptimeInfo
+            );
+          } catch (error) {
+            log('ERROR', 'Error in uptime command', { error: error.message, stack: error.stack });
+          }
+        })();
+        
+        // Return immediate response but ensure Lambda waits for processing
+        return Promise.all([
+          {
+            statusCode: 200,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(response)
+          },
+          processPromise
+        ]).then(([response]) => response);
+      }
+      else if (commandName === 'help') {
+        // Help command - respond immediately
+        const helpText = getHelp();
+        return {
+          statusCode: 200,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 4, // CHANNEL_MESSAGE_WITH_SOURCE
+            data: {
+              content: helpText
+            }
+          })
+        };
+      }
+      else {
+        // Unknown command
+        return {
+          statusCode: 200,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 4, // CHANNEL_MESSAGE_WITH_SOURCE
+            data: {
+              content: `Unknown command: ${commandName}. Type /help for a list of available commands.`
+            }
+          })
+        };
+      }
+    }
+    else if (body.type === 3) {
+      // Button click - send thinking state
+      log('INFO', 'Handling button click', { custom_id: body.data.custom_id });
+      
+      // For button clicks, we need an immediate response
+      const response = {
+        type: 5 // DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
+      };
+      
+      // Create a separate Promise to handle the button click
+      const processPromise = (async () => {
+        try {
+          // Wait a moment to ensure the initial response is sent
+          await new Promise(resolve => setTimeout(resolve, 500));
+          
+          const { custom_id } = body.data;
+          let responseMessage = '';
+          
+          if (custom_id === 'start_server') {
+            log('INFO', 'Processing start_server button');
+            responseMessage = await startServer();
+          } else if (custom_id === 'status_server') {
+            log('INFO', 'Processing status_server button');
+            responseMessage = await checkStatus();
+          } else if (custom_id === 'stop_server') {
+            log('INFO', 'Processing stop_server button');
+            // Check if user has admin role
+            const hasAdminRole = body.member && 
+                                body.member.roles && 
+                                body.member.roles.includes(process.env.ADMIN_ROLE_ID);
+            
+            if (!hasAdminRole) {
+              responseMessage = "⛔ You don't have permission to stop the server.";
+            } else {
+              responseMessage = await stopServer();
+            }
+          }
+          
+          log('INFO', 'Sending followup message');
+          
+          // Use the simplified webhook sender function
+          await sendDiscordWebhookMessage(
+            process.env.APPLICATION_ID,
+            interactionToken,
+            responseMessage
+          );
+          
+          log('INFO', 'Button processing complete');
+        } catch (error) {
+          log('ERROR', 'Error in button processing', { 
+            error: error.message,
+            stack: error.stack
+          });
+        }
+      })();
+      
+      // This ensures Lambda waits for the button processing to complete
+      return Promise.all([
+        // Return the immediate response
+        {
+          statusCode: 200,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(response)
+        },
+        // Process the button click
+        processPromise
+      ]).then(([response]) => {
+        // Return only the HTTP response
+        return response;
+      });
+    }
+    
+    // Default response for unsupported interactions
+    log('INFO', 'Unsupported interaction type', { type: body.type });
+    return {
+      statusCode: 200,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 4, // CHANNEL_MESSAGE_WITH_SOURCE
+        data: {
+          content: "I'm not sure how to respond to this interaction."
+        }
+      })
+    };
+  } catch (error) {
+    log('ERROR', 'Error handling request', { 
+      error: error.message,
+      stack: error.stack
+    });
+    return {
+      statusCode: 500,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ error: 'Internal server error' })
+    };
+  }
+};
