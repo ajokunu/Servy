@@ -1,0 +1,468 @@
+const AWS = require('aws-sdk');
+const net = require('net');
+const mcstatus = require('node-mcstatus');
+
+// Set up AWS clients and change region if not useast1
+const ec2 = new AWS.EC2({ region: process.env.MINECRAFT_REGION || 'us-east-1' });
+const dynamodb = new AWS.DynamoDB.DocumentClient();
+const INSTANCE_ID = process.env.INSTANCE_ID;
+const IDLE_TIMEOUT_SECONDS = 600; // 10 minutes
+const STARTUP_GRACE_PERIOD_MINUTES = 15; // Allow 15 minutes for server to fully start up we can make this shorter if we have better performance
+
+// Enhanced logging function
+function log(level, message, extra = {}) {
+  const logEntry = {
+    level,
+    message,
+    timestamp: new Date().toISOString(),
+    ...extra
+  };
+  console.log(JSON.stringify(logEntry));
+}
+
+/**
+ * Main Lambda handler - checks server and shuts down if idle
+ */
+exports.handler = async (event) => {
+  log('INFO', 'Checking server status', { instanceId: INSTANCE_ID });
+  
+  try {
+    // Check if the instance is running
+    const status = await getInstanceStatus();
+    if (status !== 'running') {
+      log('INFO', 'Instance is not running, no action needed', { status });
+      return { statusCode: 200, body: JSON.stringify({ message: 'Instance not running' }) };
+    }
+    
+    // Get the instance data including launch time
+    const instanceData = await ec2.describeInstances({
+      InstanceIds: [INSTANCE_ID]
+    }).promise();
+    
+    const publicIp = instanceData.Reservations[0].Instances[0].PublicIpAddress;
+    if (!publicIp) {
+      log('WARN', 'Instance has no public IP');
+      return { statusCode: 200, body: JSON.stringify({ message: 'No public IP' }) };
+    }
+    
+    // Check if the instance was recently started
+    const launchTime = new Date(instanceData.Reservations[0].Instances[0].LaunchTime);
+    const now = new Date();
+    const uptimeMinutes = (now - launchTime) / (1000 * 60); // Convert to minutes
+    
+    log('INFO', 'Server uptime', { 
+      uptimeMinutes: Math.round(uptimeMinutes),
+      launchTime: launchTime.toISOString()
+    });
+    
+    // First do a quick check if Minecraft server is running using a TCP connection
+    const isMinecraftRunning = await checkMinecraftServerRunning(publicIp);
+    if (!isMinecraftRunning) {
+      log('INFO', 'Minecraft server is not responding, will check activity record');
+    } else {
+      log('INFO', 'Minecraft server is running, checking player count');
+    }
+    
+    // Get player count if server is running
+    let playerCount = 0;
+    if (isMinecraftRunning) {
+      playerCount = await getPlayerCount(publicIp);
+      log('INFO', 'Current player count', { count: playerCount });
+      
+      // If server was recently started, reset the activity timer unconditionally
+      if (uptimeMinutes < STARTUP_GRACE_PERIOD_MINUTES) {
+        log('INFO', 'Server was recently started, resetting idle timer regardless of player count', {
+          uptimeMinutes: Math.round(uptimeMinutes),
+          threshold: STARTUP_GRACE_PERIOD_MINUTES
+        });
+        await updateServerStatus(playerCount, true);
+        return { statusCode: 200, body: JSON.stringify({ message: 'Server recently started, idle timer reset' }) };
+      }
+      
+      // Otherwise, only update the player count without changing timestamp
+      await updateServerStatus(playerCount, false);
+    }
+    
+    // Check last activity time
+    const activityData = await getServerActivity();
+    if (!activityData) {
+      log('WARN', 'No activity data found, initializing');
+      // Initialize with current timestamp if no data exists
+      await updateServerStatus(playerCount, true);
+      return { statusCode: 200, body: JSON.stringify({ message: 'Initialized activity data' }) };
+    }
+    
+    const currentTime = Math.floor(Date.now() / 1000);
+    const lastActivity = activityData.LastActivity || 0;
+    const lastPlayerCount = activityData.PlayerCount || 0;
+    const idleSeconds = currentTime - lastActivity;
+    
+    log('INFO', 'Server activity status', { 
+      idleSeconds, 
+      lastActivity: new Date(lastActivity * 1000).toISOString(),
+      lastPlayerCount,
+      currentPlayerCount: playerCount
+    });
+    
+    // If server has players, update the activity time and exit
+    if (playerCount > 0) {
+      log('INFO', 'Server has active players, resetting idle timer');
+      // Reset the timestamp only when we detect active players
+      await updateServerStatus(playerCount, true);
+      return { statusCode: 200, body: JSON.stringify({ message: 'Server active' }) };
+    }
+    
+    // Grace, the server starts up slowly, Minecraft Server start is also slow. 
+    if (uptimeMinutes < STARTUP_GRACE_PERIOD_MINUTES) {
+      log('INFO', 'Server is within startup grace period, skipping shutdown check', {
+        uptimeMinutes: Math.round(uptimeMinutes),
+        threshold: STARTUP_GRACE_PERIOD_MINUTES
+      });
+      return { 
+        statusCode: 200, 
+        body: JSON.stringify({ 
+          message: 'Server in startup grace period, not shutting down',
+          uptimeMinutes: Math.round(uptimeMinutes) 
+        }) 
+      };
+    }
+    
+    // If server is idle for more than the timeout, shut it down
+    if (idleSeconds >= IDLE_TIMEOUT_SECONDS) {
+      log('INFO', 'Server has been idle for too long, initiating shutdown', { 
+        idleSeconds, 
+        threshold: IDLE_TIMEOUT_SECONDS 
+      });
+      
+      // Safely stop the Minecraft server first
+      await safelyStopMinecraftServer(publicIp);
+      
+      // Wait a bit for graceful shutdown
+      await new Promise(resolve => setTimeout(resolve, 10000));
+      
+      // Now stop the EC2 instance
+      await ec2.stopInstances({
+        InstanceIds: [INSTANCE_ID]
+      }).promise();
+      
+      log('INFO', 'Server shutdown initiated successfully');
+      return { statusCode: 200, body: JSON.stringify({ message: 'Server shutdown initiated' }) };
+    }
+    
+    // If we got here, the server is idle but hasn't reached the timeout yet
+    log('INFO', 'Server is idle but timeout not reached', { 
+      idleSeconds, 
+      threshold: IDLE_TIMEOUT_SECONDS,
+      remainingSeconds: IDLE_TIMEOUT_SECONDS - idleSeconds 
+    });
+    
+    return { 
+      statusCode: 200, 
+      body: JSON.stringify({ 
+        message: 'Server idle but timeout not reached',
+        idleSeconds,
+        remainingSeconds: IDLE_TIMEOUT_SECONDS - idleSeconds
+      }) 
+    };
+    
+  } catch (error) {
+    log('ERROR', 'Error in monitoring function', { error: error.message, stack: error.stack });
+    return { 
+      statusCode: 500, 
+      body: JSON.stringify({ error: 'Error monitoring server' }) 
+    };
+  }
+};
+
+// Get the current instance status with fallback methods
+async function getInstanceStatus() {
+  try {
+    const data = await ec2.describeInstanceStatus({
+      InstanceIds: [INSTANCE_ID],
+      IncludeAllInstances: true
+    }).promise();
+    
+    if (data.InstanceStatuses && data.InstanceStatuses.length > 0) {
+      return data.InstanceStatuses[0].InstanceState.Name;
+    } 
+    
+    // Fallback if no status found in primary method
+    const instanceData = await ec2.describeInstances({
+      InstanceIds: [INSTANCE_ID]
+    }).promise();
+    
+    if (instanceData.Reservations && 
+        instanceData.Reservations.length > 0 && 
+        instanceData.Reservations[0].Instances && 
+        instanceData.Reservations[0].Instances.length > 0) {
+      return instanceData.Reservations[0].Instances[0].State.Name;
+    }
+    
+    throw new Error('Unable to determine instance status');
+  } catch (error) {
+    log('ERROR', 'Error getting instance status', { error: error.message });
+    throw error;
+  }
+}
+
+// Quick check if Minecraft server is running on the given IP
+async function checkMinecraftServerRunning(ip, port = 25565) {
+  return new Promise((resolve) => {
+    const client = new net.Socket();
+    const timeout = setTimeout(() => {
+      client.destroy();
+      resolve(false);
+    }, 3000);
+    
+    client.connect(port, ip, () => {
+      clearTimeout(timeout);
+      client.destroy();
+      resolve(true);
+    });
+    
+    client.on('error', () => {
+      clearTimeout(timeout);
+      resolve(false);
+    });
+  });
+}
+
+/**
+ * Get player count from Minecraft server using mcstatus.io
+ * @param {string} ip - The IP address of the server
+ * @param {number} port - The port of the server (default: 25565)
+ * @returns {Promise<number>} - Returns the number of players currently online
+ */
+async function getPlayerCount(ip, port = 25565) {
+  try {
+    // Use mcstatus.io API through the node-mcstatus library
+    const options = {
+      query: true // Enable Query protocol if supported by the server
+    };
+    
+    const result = await mcstatus.statusJava(ip, port, options);
+    
+    // Check if server is online
+    if (!result.online) {
+      log('WARN', 'Server appears offline according to mcstatus.io');
+      return 0;
+    }
+    
+    // Log detailed server info for debugging
+    log('INFO', 'Minecraft server status via mcstatus.io', { 
+      version: result.version?.name,
+      protocol: result.version?.protocol,
+      playersOnline: result.players?.online,
+      playersMax: result.players?.max,
+      motd: result.motd?.clean || 'N/A'
+    });
+    
+    // If there are player samples, log their names
+    if (result.players?.sample && result.players.sample.length > 0) {
+      const playerNames = result.players.sample.map(player => player.name);
+      log('INFO', 'Players online', { playerNames });
+    }
+    
+    // Return the number of online players
+    return result.players?.online || 0;
+  } catch (error) {
+    log('ERROR', 'Failed to get player count using mcstatus.io', { 
+      error: error.message, 
+      ip, 
+      port 
+    });
+    
+    // Try fallback method if mcstatus.io fails
+    try {
+      return await getPlayerCountFallback(ip, port);
+    } catch (fallbackError) {
+      log('ERROR', 'Fallback method also failed', { error: fallbackError.message });
+      // If both methods fail, assume 0 players
+      return 0;
+    }
+  }
+}
+
+/**
+ * Fallback method to get player count using direct socket connection
+ */
+async function getPlayerCountFallback(ip, port = 25565) {
+  return new Promise((resolve) => {
+    const client = new net.Socket();
+    let buffer = Buffer.alloc(0);
+    let receivedResponse = false;
+    
+    const timeout = setTimeout(() => {
+      client.destroy();
+      log('WARN', 'Timeout while getting player count in fallback method');
+      resolve(0);
+    }, 5000);
+    
+    client.connect(port, ip, () => {
+      log('INFO', 'Connected to Minecraft server for fallback player count method');
+      
+      try {
+        // Modern protocol (1.7+) handshake
+        const handshakeBuffer = Buffer.alloc(256);
+        let offset = 0;
+        
+        // Packet ID 0 for handshake
+        handshakeBuffer.writeInt8(0, offset++);
+        
+        // Protocol version (use 47 for 1.8+ compatibility)
+        handshakeBuffer.writeInt8(47, offset++);
+        
+        // Server address length
+        handshakeBuffer.writeInt8(ip.length, offset++);
+        
+        // Server address
+        offset += handshakeBuffer.write(ip, offset);
+        
+        // Server port
+        handshakeBuffer.writeUInt16BE(port, offset);
+        offset += 2;
+        
+        // Next state (1 for status)
+        handshakeBuffer.writeInt8(1, offset++);
+        
+        // Handshake packet length
+        const handshakePacket = Buffer.alloc(offset + 1);
+        handshakePacket.writeInt8(offset, 0);
+        handshakeBuffer.copy(handshakePacket, 1, 0, offset);
+        
+        // Status request packet (empty packet with ID 0)
+        const statusRequestPacket = Buffer.from([0x01, 0x00]);
+        
+        // Send both packets
+        client.write(handshakePacket);
+        client.write(statusRequestPacket);
+      } catch (error) {
+        log('ERROR', 'Error sending handshake packet', { error: error.message });
+      }
+    });
+    
+    client.on('data', (data) => {
+      // Append received data to buffer
+      buffer = Buffer.concat([buffer, data]);
+      
+      if (!receivedResponse && buffer.length > 5) {
+        receivedResponse = true;
+        
+        try {
+          // Look for JSON object in response
+          const bufferStr = buffer.toString('utf8');
+          const jsonMatch = bufferStr.match(/{.*}/s);
+          
+          if (jsonMatch) {
+            try {
+              // Parse JSON response
+              const parsedData = JSON.parse(jsonMatch[0]);
+              
+              // Extract player count
+              if (parsedData.players && typeof parsedData.players.online === 'number') {
+                const playerCount = parsedData.players.online;
+                log('INFO', 'Player count from fallback method', { 
+                  count: playerCount
+                });
+                
+                clearTimeout(timeout);
+                client.destroy();
+                resolve(playerCount);
+                return;
+              } else {
+                log('WARN', 'Server response did not contain player count');
+              }
+            } catch (jsonError) {
+              log('ERROR', 'Failed to parse JSON from server response', { 
+                error: jsonError.message
+              });
+            }
+          } else {
+            log('WARN', 'Could not find valid JSON in server response');
+          }
+        } catch (parseError) {
+          log('ERROR', 'Error parsing server response', { error: parseError.message });
+        }
+        
+        // If we're here, we failed to get player count
+        clearTimeout(timeout);
+        client.destroy();
+        resolve(0);
+      }
+    });
+    
+    client.on('error', (error) => {
+      log('ERROR', 'Error connecting to Minecraft server', { error: error.message });
+      clearTimeout(timeout);
+      client.destroy();
+      resolve(0);
+    });
+  });
+}
+
+async function safelyStopMinecraftServer(ip) {
+  log('INFO', 'Attempting to safely stop Minecraft server', { ip });
+  return true;
+}
+
+// Get the server activity data from DynamoDB
+async function getServerActivity() {
+  const params = {
+    TableName: process.env.DYNAMO_TABLE || 'MinecraftServerStatus',
+    Key: {
+      ServerId: INSTANCE_ID
+    }
+  };
+  
+  try {
+    const result = await dynamodb.get(params).promise();
+    return result.Item;
+  } catch (error) {
+    log('ERROR', 'Failed to get server activity', { error: error.message });
+    return null;
+  }
+}
+
+/**
+ * Update the server status in DynamoDB
+ * @param {number} playerCount - The current player count
+ * @param {boolean} resetTimestamp - Whether to reset the activity timestamp
+ */
+async function updateServerStatus(playerCount, resetTimestamp = false) {
+  // Get current record first if not resetting timestamp
+  let lastActivity = Math.floor(Date.now() / 1000); // Default to current time
+  
+  if (!resetTimestamp) {
+    try {
+      const result = await getServerActivity();
+      if (result && result.LastActivity) {
+        // Keep the existing timestamp
+        lastActivity = result.LastActivity;
+      }
+    } catch (error) {
+      log('WARN', 'Could not retrieve existing timestamp, using current time', { error: error.message });
+    }
+  }
+  
+  const params = {
+    TableName: process.env.DYNAMO_TABLE || 'MinecraftServerStatus',
+    Item: {
+      ServerId: INSTANCE_ID,
+      LastActivity: lastActivity,
+      PlayerCount: playerCount
+    }
+  };
+  
+  try {
+    await dynamodb.put(params).promise();
+    log('INFO', 'Updated server status', { 
+      playerCount, 
+      resetTimestamp, 
+      timestamp: new Date(lastActivity * 1000).toISOString() 
+    });
+    return true;
+  } catch (error) {
+    log('ERROR', 'Failed to update server status', { error: error.message });
+    return false;
+  }
+}
